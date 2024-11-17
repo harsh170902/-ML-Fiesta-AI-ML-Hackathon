@@ -1,0 +1,232 @@
+# data set needs to be provided by user
+
+import torch
+import torchaudio
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, pipeline
+from datasets import load_dataset
+import numpy as np
+import faiss  # for efficient similarity search
+from sentence_transformers import SentenceTransformer
+from transformers import TrainingArguments, Trainer
+import os
+import torchaudio.transforms as T
+from tqdm import tqdm
+import soundfile as sf
+import requests
+import zipfile
+import ipywidgets as widgets
+from IPython.display import display
+from tkinter import filedialog
+from tkinter import Tk
+import matplotlib.pyplot as plt
+import json
+
+# Function to download dataset from OneDrive
+def download_from_onedrive(url, dest_path):
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(dest_path, 'wb') as file:
+            file.write(response.content)
+        print(f"Downloaded dataset to {dest_path}")
+    else:
+        print(f"Failed to download: {response.status_code}")
+
+# Extract the downloaded zip file
+def extract_zip(zip_path, extract_to):
+    if not os.path.exists(extract_to):
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        print(f"Extracted dataset to {extract_to}")
+
+# Load the ASR model and processor
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
+asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-xlsr-53")
+
+# Load the dataset - You would use the provided dataset in your scenario
+def load_dataset_from_folder(folder_path):
+    audio_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".wav")]
+    return audio_files
+
+# Preprocess and prepare data
+def preprocess_function(batch):
+    audio = batch["audio"]
+    batch["input_values"] = processor(audio["array"], sampling_rate=audio["sampling_rate"]).input_values[0]
+    batch["labels"] = processor(batch["sentence"], padding=True, return_tensors="pt").input_ids[0]
+    return batch
+
+# Fine-tune the ASR model (training setup)
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=4,
+    num_train_epochs=3,
+    save_steps=10,
+    save_total_limit=2,
+)
+
+trainer = Trainer(
+    model=asr_model,
+    args=training_args,
+    train_dataset=None,  # Placeholder, user will provide the dataset
+)
+
+# Speech Recognition Inference
+def speech_to_text(audio_file):
+    try:
+        # Load audio
+        waveform, sample_rate = torchaudio.load(audio_file)
+        # Resample if necessary
+        if sample_rate != 16000:
+            resampler = T.Resample(orig_freq=sample_rate, new_freq=16000)
+            waveform = resampler(waveform)
+        # Process the audio input
+        input_values = processor(waveform.squeeze(), sampling_rate=16000, return_tensors="pt").input_values
+        # Get logits from the ASR model
+        with torch.no_grad():
+            logits = asr_model(input_values).logits
+        # Decode logits to text
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = processor.decode(predicted_ids[0])
+        return transcription
+    except Exception as e:
+        print(f"Error processing {audio_file}: {e}")
+        return ""
+
+# Extract transcriptions for the audio corpus
+def generate_corpus(file_list):
+    corpus = []  # Store transcriptions of audio files
+    for audio_file in tqdm(file_list, desc="Generating Corpus"):
+        transcription = speech_to_text(audio_file)
+        if transcription:
+            corpus.append(transcription)
+    return corpus
+
+# Convert text to embeddings using a language model (e.g., DistilBERT)
+def generate_embeddings(corpus):
+    model = SentenceTransformer("distilbert-base-nli-mean-tokens")
+    corpus_embeddings = model.encode(corpus, convert_to_tensor=True, show_progress_bar=True)
+    return model, corpus_embeddings
+
+# Create FAISS index for similarity search
+def create_faiss_index(corpus_embeddings):
+    corpus_embeddings = corpus_embeddings.cpu().detach().numpy()  # Convert to numpy for FAISS
+    dimension = corpus_embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(corpus_embeddings)
+    return index
+
+# Question Answering - User input and response
+def question_answering_pipeline(question_audio_file, model, index, corpus):
+    # Convert question to text
+    question_text = speech_to_text(question_audio_file)
+    if not question_text:
+        return "Could not process the question audio."
+    print(f"Question: {question_text}")
+    # Convert question text to embedding
+    question_embedding = model.encode([question_text], convert_to_tensor=True, show_progress_bar=False).cpu().detach().numpy()
+    # Search in FAISS index
+    _, nearest_indices = index.search(np.array(question_embedding), k=1)
+    # Retrieve and return the most relevant response
+    answer_idx = nearest_indices[0][0]
+    return corpus[answer_idx]
+
+# New Functionality - Generate Summary of Corpus
+def generate_summary(corpus):
+    print("Generating summary of the corpus...")
+    # Concatenate all transcriptions and generate a simple summary (for demonstration purposes)
+    full_text = ' '.join(corpus)
+    summary_length = min(len(full_text) // 10, 500)  # Generate a summary of approximately 500 characters
+    summary = full_text[:summary_length] + "..."
+    print("Summary of the Corpus:")
+    print(summary)
+    return summary
+
+# New Functionality - Visualization of Corpus Lengths
+def visualize_corpus_lengths(corpus):
+    lengths = [len(text) for text in corpus]
+    plt.figure(figsize=(10, 6))
+    plt.hist(lengths, bins=20, color='skyblue', edgecolor='black')
+    plt.xlabel('Length of Transcription')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Transcription Lengths in Corpus')
+    plt.show()
+
+# New Functionality - Save Corpus to JSON
+def save_corpus_to_json(corpus, filename="corpus.json"):
+    with open(filename, 'w') as json_file:
+        json.dump(corpus, json_file, indent=4)
+    print(f"Corpus saved to {filename}")
+
+# Full pipeline in Jupyter Notebook
+def main():
+    # Widgets for user inputs
+    onedrive_url_widget = widgets.Text(
+        value='',
+        placeholder='Enter the OneDrive URL for the dataset',
+        description='OneDrive URL:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='80%')
+    )
+    display(onedrive_url_widget)
+
+    destination_path = "sandalwood_dataset.zip"
+    extracted_folder = "sandalwood_dataset"
+
+    def on_download_button_clicked(b):
+        onedrive_url = onedrive_url_widget.value
+        # Download and extract dataset
+        if onedrive_url:
+            download_from_onedrive(onedrive_url, destination_path)
+            extract_zip(destination_path, extracted_folder)
+        else:
+            # Allow user to upload a folder or single file using file dialog
+            Tk().withdraw()  # Hide the root window
+            folder_path = filedialog.askdirectory(title="Select Dataset Folder")
+            if folder_path:
+                global file_list
+                file_list = load_dataset_from_folder(folder_path)
+                print("Dataset loaded from selected folder.")
+        # Generate corpus from audio files
+        global corpus
+        corpus = generate_corpus(file_list)
+        # Generate embeddings for the corpus
+        global model, corpus_embeddings, index
+        model, corpus_embeddings = generate_embeddings(corpus)
+        # Create FAISS index
+        index = create_faiss_index(corpus_embeddings)
+        print("Dataset processed successfully.")
+        # Additional functionalities
+        generate_summary(corpus)
+        visualize_corpus_lengths(corpus)
+        save_corpus_to_json(corpus)
+
+    download_button = widgets.Button(description="Download or Upload Dataset and Process")
+    download_button.on_click(on_download_button_clicked)
+    display(download_button)
+
+    question_audio_widget = widgets.Text(
+        value='',
+        placeholder='Enter the path to your question audio file',
+        description='Question Audio Path:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='80%')
+    )
+    display(question_audio_widget)
+
+    def on_answer_button_clicked(b):
+        question_audio_file = question_audio_widget.value
+        if not question_audio_file:
+            Tk().withdraw()  # Hide the root window
+            question_audio_file = filedialog.askopenfilename(title="Select Question Audio File", filetypes=[("Audio Files", "*.wav *.mp3")])
+        # Answer the question using the question answering pipeline
+        if question_audio_file:
+            answer = question_answering_pipeline(question_audio_file, model, index, corpus)
+            print("Answer:", answer)
+
+    answer_button = widgets.Button(description="Get Answer")
+    answer_button.on_click(on_answer_button_clicked)
+    display(answer_button)
+
+# Run the main function
+main()
